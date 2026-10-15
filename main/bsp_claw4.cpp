@@ -33,6 +33,7 @@
 
 static const char* TAG = "ptd";
 
+
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static esp_lcd_panel_handle_t  s_panel   = NULL;
 static esp_lcd_dsi_bus_handle_t s_dsi_bus = NULL;
@@ -54,7 +55,35 @@ void delayMs(uint32_t ms) {
   }
 }
 
-void feedWdt(void) { esp_task_wdt_reset(); }
+// ⚠️ v0.5.0 真机踩坑（闪屏 → 满屏日志 → 渲染饿死）：
+//   esp_task_wdt_reset() 只能由**已订阅** WDT 的任务调用，否则返回
+//   ESP_ERR_NOT_FOUND 并由 IDF 打一条 E/W 级日志。app_main 是普通任务，
+//   默认不在订阅名单里（CONFIG_ESP_TASK_WDT_INIT 只自动订阅 idle），
+//   于是主循环每帧都触发一条错误日志 —— 串口刷屏的速率足以让渲染
+//   饿死，表现为画面闪烁无内容。
+//
+// 正确做法：在 init 里显式订阅，feedWdt 保持无条件调用（语义仍清晰），
+// 并且**只在第一次订阅失败时降级为静默**，避免日志风暴掩盖真问题。
+static bool s_wdt_ok = false;
+
+static void wdt_subscribe(void) {
+  esp_err_t err = esp_task_wdt_add(NULL);
+  if (err == ESP_OK) {
+    s_wdt_ok = true;
+    ESP_LOGI(TAG, "WDT subscribed (app_main)");
+  } else if (err == ESP_ERR_INVALID_STATE) {
+    // 已订阅（重复 init），视为成功
+    s_wdt_ok = true;
+  } else {
+    ESP_LOGW(TAG, "WDT subscribe failed (%s); feedWdt disabled", esp_err_to_name(err));
+    s_wdt_ok = false;
+  }
+}
+
+void feedWdt(void) {
+  // 未订阅时静默返回：WDT 是"保险丝"，不是功能。宁可不喂也不能刷屏。
+  if (s_wdt_ok) esp_task_wdt_reset();
+}
 
 // ============================================================================
 // I2C（GT911 用）
@@ -117,6 +146,7 @@ void GfxClaw4::setBrightness(int pct) {
 //   esp_lcd_new_rgb_dbi_panel 传 fb 时会自己处理 framebuffer 属性，我们只负责
 //   分配时用 MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA（见下）。
 void GfxClaw4::init(void) {
+  wdt_subscribe();
   i2c_bus_init();
   backlight_init();
 
