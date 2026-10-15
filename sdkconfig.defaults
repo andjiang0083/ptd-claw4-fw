@@ -58,3 +58,14 @@ CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 #（真机症状：闪屏无内容）。要调试时用 idf.py menuconfig 临时调高，
 # 不要写死在这里。
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ── v0.5.1：FreeRTOS tick 100Hz → 1000Hz（1ms 粒度）────────────────
+# 为什么：主循环用 vTaskDelay(1) 让出 CPU，而它延迟的是**整数个 tick**。
+#   100Hz 下 1 tick = 10ms ⇒ 33ms 的帧间隔被量化到 40ms ⇒ 实测
+#   fps=25.4 而不是 30（真机日志逐行都在报这个数）。
+#   1ms 粒度下同样的写法给出 ~33ms ⇒ 30fps。
+# 代价：tick 中断从 100 次/秒 升到 1000 次/秒。360MHz 的 P4 上这点开销
+#   换 15% 的帧率完全划算；且我们每帧只干 2ms 活，空闲时间本来就是等。
+# ⚠️ 改这里必须删掉 build/sdkconfig 才会重新生成（idf.py 不会自动感知
+#    defaults 的变化）。
+CONFIG_FREERTOS_HZ=1000
