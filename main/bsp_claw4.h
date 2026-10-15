@@ -41,7 +41,21 @@
 // ════════════════════════════════════════════════════════════════════
 #define CLAW4_LCD_H_RES      720
 #define CLAW4_LCD_V_RES      720
-#define CLAW4_LCD_BPP        16          // RGB565，与 GfxFb 一致
+
+// ════════════════════════════════════════════════════════════════════
+// 游戏帧缓冲的像素格式 = 24（RGB888）
+// ════════════════════════════════════════════════════════════════════
+// v0.5.1：必须在 include src/gfx_fb.h **之前**定义（main.cpp 里
+// bsp_claw4.h 排在 gfx_fb.h 前面，所以定义放这里）。
+//
+// 为什么是 24 而不是 16：
+//   本板的 DSI 流与面板 COLMOD 都是 RGB888（retro-go-tab5 的
+//   mipi_dsi_claw4.h 注释写死了"fb 565 + 流 888 只剩 DSI 桥硬件转换
+//   一条路，实测那条路是蓝屏（欠载）"）。既然 fb 必须是 888，
+//   那就让游戏**直接画 888**——v0.5.0 是"画 565 + 每帧全量展开成
+//   888"，那笔展开（518400 次乘除 + 1.55MB 写）是帧时间的主要成分。
+//   改成本文件后，它整个消失了。
+#define PTD_FB_BPP           24
 #define CLAW4_LCD_RST_PIN    3           // 与摄像头共用复位线
 #define CLAW4_DSI_LANES      2
 #define CLAW4_DSI_LDO_CHAN   3
@@ -77,12 +91,27 @@
 //      是官方固件实测能亮屏的参数，不要自行"改大试试"。
 //   3. video mode 下帧缓冲常驻扫描，无需逐帧提交；commit() 留作
 //      "真机出现撕裂时的手动刷新"挂载点。
+// ════════════════════════════════════════════════════════════════════
+// Gfx 实现——直接画进 DSI 驱动自己的帧缓冲
+// ════════════════════════════════════════════════════════════════════
+// v0.5.1 的关键改动：**零转换 + 零拷贝**。
+//
+// v0.5.0 的管线是"GfxFb 画进一块自分配的 RGB565 → commit 全量展开成
+// 一块自分配的 RGB888 → draw_bitmap 把 1.55MB memcpy 进驱动的 fb"。
+//
+// 读 esp_lcd_panel_dpi.c:520 的 dpi_panel_draw_bitmap_2d 会发现：
+//     if (draw_buffer 落在 fbs[i] 的内存区间内)
+//         → 不 memcpy，只 esp_cache_msync 回写，并切 cur_fb_index
+// 于是只要**画进驱动的 fb**，那两笔开销（全量格式展开 + 整块 memcpy）
+// 就一起没了。剩下的只有 msync——而 msync 是无论如何都要做的
+// （P4 的 PSRAM 是 cacheable，DSI 的 DPI 硬件直接读物理内存）。
+//
+// 代价：失去"自己那块 565 缓冲"带来的双缓冲/整屏裁剪自由。但本游戏
+// 本来就是单缓冲 + 脏格重绘，不需要。
 class GfxClaw4 {
  public:
-  // DSI 目标缓冲：RGB888（面板 colmod 0x77 / DSI 流 out_color_format 均为 RGB888）
-  uint8_t*  fb888 = nullptr;
-  // GfxFb 写入的中间缓冲：RGB565（游戏侧仍按 565 生成）
-  uint16_t* fb = nullptr;
+  // = esp_lcd_dpi_panel_get_frame_buffer() 取回的那一块（不是我们分配的）
+  uint8_t*  fb = nullptr;
   void init(void);
   void setRotation(int) {}             // 方形屏 native 朝向即最终朝向
   void commit(void);

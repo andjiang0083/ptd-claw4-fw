@@ -69,7 +69,6 @@ static void saveProgress(void) {
   nvsPutU32("stars",  packStars(0));
   nvsPutU32("stars2", packStars(10));
   nvsPutU8("mute",s_muted ? 1 : 0);
-  nvsPutU8("lang",  (uint8_t)g_lang);
   nvsPutU8("onboarded", g_onboarded ? 1 : 0);
   nvsPutU16("endbest", (uint16_t)g_endBest);
   nvsSave();
@@ -78,8 +77,8 @@ static void saveProgress(void) {
 static const uint32_t FRAME_MS = 33;   // 30fps
 
 extern "C" void app_main(void) {
-  ESP_LOGI(TAG, "=== PIXEL TOWER DEFENSE v0.5.0 | Claw4 | %dx%d ===",
-           SCREEN_W, SCREEN_H);
+  ESP_LOGI(TAG, "=== PIXEL TOWER DEFENSE v0.5.1 | Claw4 | %dx%d | fb %dbpp ===",
+           SCREEN_W, SCREEN_H, PTD_FB_BPP);
 
   // ── 1. 板级初始化 ────────────────────────────────────────────────
   g_bsp.init();
@@ -99,7 +98,6 @@ extern "C" void app_main(void) {
   uint32_t pk1 = nvsGetU32("stars", 0);
   uint32_t pk2 = nvsGetU32("stars2", 0);
   sfxSetMuted(nvsGetU8("mute", 0) != 0);
-  setLang(nvsGetU8("lang", LANG_EN));
   g_onboarded = nvsGetU8("onboarded", 0) != 0;
   g_endBest   = (int16_t)nvsGetU16("endbest", 0);
   for (int i = 0; i < LEVEL_COUNT && i < 10;++i)  g_stars[i] = (uint8_t)((pk1 >> (i*3)) & 7);
@@ -111,8 +109,8 @@ extern "C" void app_main(void) {
   drawTitle(&g_gfx);
   g_bsp.commit();       // 首帧立即推送，不等主循环（否则白屏 1 帧）
 
-  ESP_LOGI(TAG, "unlock=%04X cleared=%04X levels=%d lang=%s",
-           g_unlocked, g_cleared, LEVEL_COUNT, langCN() ? "CN" : "EN");
+  ESP_LOGI(TAG, "unlock=%04X cleared=%04X levels=%d",
+           g_unlocked, g_cleared, LEVEL_COUNT);
 
   // ── 3. 主循环（对应上游 loop()）─────────────────────────────────
   static uint32_t lastFrame = 0;
@@ -162,5 +160,22 @@ extern "C" void app_main(void) {
 
     progressTickOnClear();
     g_bsp.commit();
+
+    // ── 帧时间统计（每 60 帧打一次）──────────────────────────────
+    // v0.5.1 性能改动要能被量化，不然"变快了"只是感觉。
+    // 这里量的是"帧间隔"（含 FRAME_MS 的等待），所以稳态下应接近
+    // FRAME_MS；真正要看的是它**超过** FRAME_MS 多少——那部分是
+    // 渲染 + commit 的真实成本。
+    static uint32_t perfN = 0, perfT0 = 0, perfOver = 0;
+    if (perfN == 0) perfT0 = now;
+    if (dt > FRAME_MS) perfOver += (dt - FRAME_MS);
+    if (++perfN >= 60) {
+      ESP_LOGI(TAG, "fps=%.1f  render+commit overrun=%u ms/60f  px/frame=%llu",
+               60000.0f / (float)(now - perfT0),
+               (unsigned)perfOver,
+               (unsigned long long)(GfxFb::pxFilled / 60));
+      perfN = 0; perfOver = 0;
+      GfxFb::pxFilled = 0;
+    }
   }
 }

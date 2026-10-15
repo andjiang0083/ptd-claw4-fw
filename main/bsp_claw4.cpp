@@ -35,6 +35,10 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 
+// 游戏渲染内核：本文件要用 GfxFb 的脏矩形（GfxFb::drY0 等静态成员）。
+// 放在 bsp_claw4.h 之后 —— PTD_FB_BPP 由它定义，gfx_fb.h 依赖这个宏。
+#include "gfx_fb.h"
+
 static const char* TAG = "ptd";
 
 
@@ -251,31 +255,26 @@ void GfxClaw4::init(void) {
   // 于是整个游戏把画面画在一块从未被扫描的内存里 —— 初始化全绿
   //（DSI up / GT911 / audio init都成功），但屏幕永远黑。
   //
-  // 这是 video mode 的固有契约：帧缓冲由 DSI 驱动持有，应用只能通过
-  // esp_lcd_dpi_panel_get_frame_buffer() 取回。不能自己分配。
-  //帧缓冲由**应用**分配，不再问驱动要。
+  // v0.5.1：**拿驱动那块自己用的帧缓冲来画**。
   //
-  // v0.5.0 上午的三次失败都源于选了 video mode：那条路径下帧缓冲由
-  // esp_lcd_panel_dpi 持有，应用只能"取"，而应用自己画的像素要经过
-  // msync 才能被 DMA 看到、in/out_color_format 要自己设对（且
-  // LCD_COLOR_FMT_RGB565 == 0 会被 if 判断当成"没设置"）、
-  // COLMOD 还得指望厂商驱动去发——但它从来不发。
+  // 之前（v0.5.0）是"自己 malloc 565 → 每帧展开成自己 malloc 的 888
+  // → draw_bitmap 把 1.55MB memcpy 进驱动那块"。三份缓冲、两笔全屏开销。
   //
-  // 改用驱动的 draw_bitmap 路径后，这四件事全部由驱动自己负责
-  // （见 esp_lcd_panel_dpi.c:518/541/555，它每帧都msync），
-  // 而且这是官方固件走过的、被实机验证过的唯一路径。
-  // 代价是失去 video mode 的零拷贝，每帧多一次 memcpy——
-  // 对 720x720x2 = 1MB 而言约 1ms，P4 上完全可以接受。
-  fb_bytes_cached = (size_t)CLAW4_LCD_H_RES * CLAW4_LCD_V_RES * 3;
-  fb888 = (uint8_t*)heap_caps_malloc(fb_bytes_cached, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-  ESP_ERROR_CHECK(fb888 ? ESP_OK : ESP_ERR_NO_MEM);
-  memset(fb888, 0, fb_bytes_cached);
-  const size_t fb565_bytes = (size_t)CLAW4_LCD_H_RES * CLAW4_LCD_V_RES * 2;
-  fb = (uint16_t*)heap_caps_malloc(fb565_bytes, MALLOC_CAP_SPIRAM);
-  ESP_ERROR_CHECK(fb ? ESP_OK : ESP_ERR_NO_MEM);
-  memset(fb, 0, fb565_bytes);
-  ESP_LOGI(TAG, "fb888=%p (%u B)  fb565=%p (%u B)  [RGB888 DSI baseline]",
-           fb888, (unsigned)fb_bytes_cached, fb, (unsigned)fb565_bytes);
+  // 现在只留一份：驱动自己的那块。draw_bitmap 传进去的指针落在
+  // fbs[0] 区间内，驱动就会走 esp_lcd_panel_dpi.c 里那条
+  // "do_copy = false → 只 msync" 的分支（见该文件 520 行附近）。
+  // 于是每帧只剩：绘制本身 + msync 脏行。
+  {
+    void* pfb = nullptr;
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &pfb));
+    fb = (uint8_t*)pfb;
+    ESP_ERROR_CHECK(fb ? ESP_OK : ESP_ERR_NO_MEM);
+    // 驱动只保证"这块内存存在"，不保证内容。清一次，避免上电花屏。
+    fb_bytes_cached = (size_t)CLAW4_LCD_H_RES * CLAW4_LCD_V_RES * 3;
+    memset(fb, 0, fb_bytes_cached);
+    ESP_LOGI(TAG, "fb=%p (%u B, driver-owned)  [RGB888 zero-conversion]",
+             fb, (unsigned)fb_bytes_cached);
+  }
 
   // ── 6. 上屏 ────────────────────────────────────────────────────
   ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
@@ -299,8 +298,7 @@ void GfxClaw4::init(void) {
   ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
   setBrightness(s_backlight);
-  ESP_LOGI(TAG, "DSI up: %dx%d RGB565 fb=%p",
-           CLAW4_LCD_H_RES, CLAW4_LCD_V_RES, fb888);
+  ESP_LOGI(TAG, "DSI up: %dx%d RGB888 fb=%p", CLAW4_LCD_H_RES, CLAW4_LCD_V_RES, fb);
 }
 
 // ⚠️ v0.5.0 真机"文字残缺、背景正常"根因：PSRAM cache 未回写。
@@ -319,28 +317,40 @@ void GfxClaw4::init(void) {
 //   官方 Claw4 固件走自己的显示栈，天然带这一步；我直接用
 //   esp_lcd_panel_dpi 的 video mode，就漏了。
 //
-// 代价：每帧 1.03MB 写回。P4 的 PSRAM 200MHz 双倍带宽足够
-//   （30fps 下约 30MB/s），实测不会成为瓶颈。若将来成为瓶颈，
-//   正确做法是给 GfxFb 加脏矩形跟踪，只 msync 变化区域。
-// GfxFb 交来的是 RGB565 画面，本板帧缓冲是 RGB888 —— commit 负责转换。
-// 用 PPA 硬件做（esp_lcd_panel_dpi 在 use_dma2d 时会走 PPA 拷贝），
-// 但我们这里 fb 与目标格式一致，桥不需要转换，所以转换必须在 CPU 侧完成。
-// 720x720 全屏转换用 PPA 的 fill 模式代价高；实测 retro-go 用的是
-// "逐行 565→888 展开 + 分块推送"，这里采用同样做法：
-//   每帧把 fb565 全量展开到 fb888，再一次性 draw_bitmap。
-// 展开是纯顺序写，720*720 次，CPU 上约 2-3ms，可接受。
+// 代价：每帧 1.55MB 写回（RGB888）。P4 的 PSRAM 200MHz 双倍带宽足够，
+//   但它毕竟是每帧固定支出 —— v0.5.1 因此给 GfxFb 加了脏矩形跟踪，
+//   只 msync 变化的那几行（见下面的 commit）。
+//
+// ── 提交一帧 ────────────────────────────────────────────────────────
+// v0.5.1：不再有任何格式转换与整块拷贝。
+//   游戏已经把 RGB888 直接画进了驱动那块帧缓冲，这里只做两件事：
+//     ① 按脏矩形算出要回写的扫描行区间
+//     ② draw_bitmap 让驱动 msync 这些行（它识别出指针是自己人，不会 memcpy）
+//
+// ⚠️ msync 的粒度是**整行**：esp_lcd_panel_dpi.c 里是
+//     cache_sync_start = fbs[i] + y_start * h_pixels * bpp/8
+//     cache_sync_size  = (y_end - y_start) * h_pixels * bpp/8
+//   它不认 x。所以脏矩形的 x 范围在这里用不上（保留给将来做列级优化），
+//   真正省时间的是 y 范围——战斗中通常只有地图中间那些行在动。
+//
+// ⚠️ 为什么必须有"脏矩形为空就跳过"这一条：
+//   标题/选关是静态界面，主循环里每 20ms 都会调 commit。没有这一条，
+//   静态界面也在每帧 msync 全屏 1.55MB，纯属白烧。
 void GfxClaw4::commit(void) {
-  if (!fb888 || !s_panel || !fb) return;
-  // RGB565 → RGB888 全量展开（小端 uint16 → 3 字节 BGR/RGB 序由 COLMOD 决定）
-  const int px = CLAW4_LCD_H_RES * CLAW4_LCD_V_RES;
-  uint8_t* dst = fb888;
-  for (int i = 0; i < px; ++i) {
-    const uint16_t v = fb[i];
-    dst[i * 3 + 0] = (uint8_t)(((v >> 11) & 0x1F) * 255 / 31);   // R
-    dst[i * 3 + 1] = (uint8_t)(((v >> 5) & 0x3F) * 255 / 63);    // G
-    dst[i * 3 + 2] = (uint8_t)((v & 0x1F) * 255 / 31);            // B
-  }
-  esp_lcd_panel_draw_bitmap(s_panel, 0, 0, CLAW4_LCD_H_RES, CLAW4_LCD_V_RES, fb888);
+  if (!s_panel || !fb) return;
+  if (GfxFb::dirtyEmpty()) return;              // 本帧什么都没画
+
+  int x0 = GfxFb::drX0, y0 = GfxFb::drY0;
+  int x1 = GfxFb::drX1, y1 = GfxFb::drY1;
+  GfxFb::dirtyReset();                          // 先取再清，避免竞态
+
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > CLAW4_LCD_H_RES - 1) x1 = CLAW4_LCD_H_RES - 1;
+  if (y1 > CLAW4_LCD_V_RES - 1) y1 = CLAW4_LCD_V_RES - 1;
+
+  // draw_bitmap 的窗口是半开区间 [x_start, x_end)
+  esp_lcd_panel_draw_bitmap(s_panel, x0, y0, x1 + 1, y1 + 1, fb);
 }
 
 // ============================================================================
