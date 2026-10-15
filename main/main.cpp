@@ -117,6 +117,27 @@ extern "C" void app_main(void) {
              (unsigned)(millis() - t0));
   }
 
+  // ── 色序自检（v0.5.1）：真机可机判的字节序探针 ────────────────────
+  // 用户报"感觉没有红色" → 根因：RGB888 帧缓冲的内存字节序写成了 R,G,B，
+  // 正确的是 **B,G,R**（IDF/LVGL RGB888 的通用布局，本板厂商同款）。
+  // 这类 bug 在 x86 仿真里测不到（sim 整个按 16bpp 编），所以只能在真机判：
+  // 把"画进帧缓冲的那 3 个字节"直接打出来，一条日志就能定案。
+  //   0xF800 纯红 → 期望 [00,00,FF]（B,G,R 序下 R 落在第三个字节）
+  //   0x07E0 纯绿 → 期望 [00,FF,00]
+  //   0x001F 纯蓝 → 期望 [FF,00,00]
+  // 用 (0,0)..(2,0) 三个像素，测完按原字节**原样恢复**，画面上不留痕迹。
+  {
+    static const uint16_t cols[3] = {0xF800, 0x07E0, 0x001F};
+    uint8_t* p = (uint8_t*)g_bsp.fb;
+    uint8_t save[9];
+    memcpy(save, p, sizeof(save));
+    for (int i = 0; i < 3; ++i) g_gfx.drawPixel(i, 0, cols[i]);
+    for (int i = 0; i < 3; ++i)
+      ESP_LOGI(TAG, "color 0x%04X -> mem %02X %02X %02X  (order B,G,R)",
+               cols[i], p[i*3+0], p[i*3+1], p[i*3+2]);
+    memcpy(p, save, sizeof(save));
+  }
+
   ESP_LOGI(TAG, "unlock=%04X cleared=%04X levels=%d",
            g_unlocked, g_cleared, LEVEL_COUNT);
 
