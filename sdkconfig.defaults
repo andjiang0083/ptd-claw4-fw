@@ -1,0 +1,55 @@
+# ==== PIXEL TOWER DEFENSE — Metalio Claw4 ====
+CONFIG_IDF_TARGET="esp32p4"
+
+# ── MIPI-DSI：Claw4 的 720x720 屏走 DSI ────────────────────────────
+# ⚠️ IDF 把 dsi/include 的头路径挂在 CONFIG_SOC_MIPI_DSI_SUPPORTED 条件上。
+#    不显式打开 → esp_lcd_mipi_dsi.h 找不到。
+#    症状极具迷惑性：报的是"所有 BSP 符号都未声明"
+#    （GfxClaw4 / touchRead / nvsPutU32 全丢），因为 bsp_claw4.h 整块被
+#    #if SOC_MIPI_DSI_SUPPORTED 条件掉了——看不出真实病因只是缺一个 Kconfig。
+CONFIG_SOC_MIPI_DSI_SUPPORTED=y
+CONFIG_SOC_LCDCAM_RGB_LCD_SUPPORTED=y
+
+# ── GT911 触摸 ─────────────────────────────────────────────────────
+CONFIG_ESP_LCD_TOUCH_I2C_GT911_ENABLED=y
+CONFIG_ESP_LCD_TOUCH_MAX_FINGER_NUM=5
+
+# ── PSRAM：帧缓冲所在地（720x720x2 = 1.03MB）──────────────────────
+# ⚠️ 必须 200MHz —— 原 Tab5 项目注释里记了"不满足时直接报 M5Tab5 need PSRAM
+#    SPEED 200MHz"。这里同理，且帧缓冲走 DSI DMA，对 PSRAM 时序更敏感。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+
+# ── Flash：Claw4 是 32MB ─────────────────────────────────────────
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# ── CPU：480MHz（游戏 30fps + DSI DMA 扫描）────────────────────────
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_480=y
+
+# ── 看门狗：主循环每帧 feedWdt()，10s 超时足够 ────────────────────
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# ── 主任务栈：游戏逻辑 + 帧缓冲操作，8K足够 ─────────────────────────
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ── I2C（GT911）────────────────────────────────────────────────────
+CONFIG_I2C_ENABLE=y
+
+# ── 音频 I2S 标准模式 + DMA ────────────────────────────────────────
+CONFIG_I2S_ENABLE=y
+CONFIG_I2S_ISR_IRAM_SAFE=y
+
+# ── 分区表 ────────────────────────────────────────────────────────
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ── 关掉用不上的东西，省 flash ─────────────────────────────────────
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n

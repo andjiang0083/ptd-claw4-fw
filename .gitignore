@@ -1,0 +1,14 @@
+# 构建产物
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# 托管组件（idf.py build 会按 idf_component.yml 重新拉取）
+managed_components/
+
+# 生成的配置（由 ../pixel-tower-defense/tools/layout.py --profile claw4 生成）
+gen/config_gen.h
+
+# macOS
+.DS_Store

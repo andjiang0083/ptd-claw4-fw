@@ -1,0 +1,18 @@
+## PTD Claw4 — 组件依赖
+##
+## ⚠️ esp_lcd_panel_io_additions 是这个固件能起来的**关键**依赖：
+##   ESP-IDF 自带的 DSI 面板 API 是 esp_lcd_new_panel_dpi()，它只负责 DPI
+##   时序输出，**不含面板厂商的 init command 序列** —— 意味着你要手写
+##   NV3051F（720x720 MIPI-DSI）的初始化寄存器表，写错一个字节就是黑屏。
+##
+##   esp_lcd_panel_io_additions 提供了更高层的 esp_lcd_new_rgb_dbi_panel()
+##   并内建 NV3051F / FL7707N 的官方初始化表。这正是 Claw4 原固件用的方案
+##   （见 CloudZao/MetalioClaw4 的 main/idf_component.yml）。
+##
+##   版本对齐：Claw4 要求 ESP-IDF v5.5.4，本机是 v5.5.2 ——
+##   esp_lcd_panel_io_additions 1.0.x 同时兼容 5.5 与 5.6。
+dependencies:
+  ## DBI/DPI 面板高层封装（提供 esp_lcd_new_rgb_dbi_panel + NV3051F/FL7707N init）
+  espressif/esp_lcd_panel_io_additions: "^1.0.1"
+  ## GT911 电容触摸（Claw4 的触控芯片）
+  espressif/esp_lcd_touch_gt911: "^1"
