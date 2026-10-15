@@ -103,7 +103,7 @@ extern "C" {
 
 // ── 触摸 ────────────────────────────────────────────────────────────
 struct Claw4TouchPoint { int x, y; bool down; };
-void  touchInit(void);
+bool  touchInit(void);   // 失败返回 false（触摸不可用不阻塞启动）
 bool  touchRead(Claw4TouchPoint* out);   // false = 无触摸
 int   touchWidth(void);
 int   touchHeight(void);

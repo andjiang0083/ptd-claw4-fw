@@ -84,7 +84,7 @@ extern "C" void app_main(void) {
   // ── 1. 板级初始化 ────────────────────────────────────────────────
   g_bsp.init();
   g_gfx = GfxFb(g_bsp.fb, false);      // 借用 BSP 的 PSRAM 帧缓冲
-  touchInit();
+  if (!touchInit()) ESP_LOGW(TAG, "touch unavailable — 画面可看，交互不可用");
   audioInit();
   audioSetVolume(70);
   nvsInit();

@@ -28,6 +28,9 @@
 #include "esp_lcd_panel_ops.h"     // esp_lcd_panel_disp_on_off/reset/init
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_nv3051f.h"
+#include "esp_lcd_io_i2c.h"          // esp_lcd_new_panel_io_i2c_v2（不在 esp_lcd_panel_io_i2c.h）
+#include "esp_lcd_touch.h"
+#include "esp_lcd_touch_gt911.h"
 #include "esp_ldo_regulator.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -38,6 +41,8 @@ static const char* TAG = "ptd";
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static esp_lcd_panel_handle_t  s_panel   = NULL;
 static esp_lcd_panel_io_handle_t s_lcd_io = NULL;   // 保留以便手动补发 COLMOD/MADCTL
+static esp_lcd_touch_handle_t   s_touch   = NULL;   // GT911
+static bool                     s_touch_dev = false;
 static esp_lcd_dsi_bus_handle_t s_dsi_bus = NULL;
 static ledc_channel_t          s_bl_chan = LEDC_CHANNEL_0;
 static int                     s_backlight = 80;
@@ -341,106 +346,89 @@ void GfxClaw4::commit(void) {
 // ============================================================================
 // 触摸：GT911（I2C）
 // ============================================================================
-#define GT911_ADDR      0x5D
-// GT911 寄存器地址是 16 位，但 i2c_master_transmit 收的 buf 是 uint8_t*，
-// 所以这里只保留低 8 位（高字节是寄存器 bank 标志，本驱动不需要）。
-#define GT911_STATUS    ((uint8_t)0x4E)
-#define GT911_DATA      ((uint8_t)0x50)
-#define GT911_MAX_PT    5
-
-void touchInit(void) {
+// 参数照搬官方板级源码（MetalioClaw4 的 InitializeTouch），
+// 并与同作者 retro-go-tab5 claw4 分支（rg_input.c: rg_touch_init）对齐：
+//
+//  ① I2C 地址必须**探测**：GT911 的地址取决于 INT 脚上电时的电平，
+//     两个都可能是 0x5D 或 0x14。官方与 retro-go 都是先 0x5D、
+//     probe 失败再 0x14。我此前硬编码 0x5D → 屏不亮时它其实在 0x14。
+//  ② INT = GPIO33、**低有效**、板上未接 RST。
+//     我此前把 INT 配成输出并做脉冲复位——那是错的：INT 是屏主动拉低的
+//     中断线，驱动它等于跟屏抢总线。
+//  ③ I2C 速率 200kHz（与电量计 BQ27220 同总线；官方注释：400k 在
+//     总线抖动时更容易 clear-bus 失败）。我此前用 400k。
+//  ④ 复用**显示驱动已建好的 I2C 总线**。官方板级注释明确警告：
+//     "GT911 与 TCA9555 若各建各的 I2C 外设会抢总线 ⇒ 通信失败。"
+//     我此前在 touchRead 路径里反复 i2c_master_bus_add_device，
+//     既泄漏句柄又制造多设备抢总线。
+//
+// 用官方 esp_lcd_touch_gt911 组件而不是手写寄存器读写：手写要自己对
+// 0x814E/0x8150 这类 16 位寄存器地址做 bank 选择，容易错；
+// 组件已经处理了这些细节。
+bool touchInit(void) {
+  if (s_touch_dev) return true;
   i2c_bus_init();
-  // INT 低有效 → GPIO 输入 + 下拉
-  gpio_config_t icfg = {
-    .pin_bit_mask = 1ULL << CLAW4_TOUCH_INT,
-    .mode = GPIO_MODE_INPUT,
-    .pull_up_en   = GPIO_PULLUP_DISABLE,     // GT911 INT 低有效 → 用下拉
-    .pull_down_en = GPIO_PULLDOWN_ENABLE,
-    .intr_type = GPIO_INTR_DISABLE,
-  };
-  ESP_ERROR_CHECK(gpio_config(&icfg));
+  if (!s_i2c_bus) { ESP_LOGE(TAG, "touch: I2C bus unavailable"); return false; }
 
-  // GT911 上电默认寄存器地址；INT 拉一个脉冲让控制器切到 0x5D
-  gpio_set_level(CLAW4_TOUCH_INT, 0);
-  vTaskDelay(pdMS_TO_TICKS(10));
-  gpio_set_level(CLAW4_TOUCH_INT, 1);
-  vTaskDelay(pdMS_TO_TICKS(10));
-
-  uint8_t buf[1] = {0};
-  i2c_master_dev_handle_t dev = NULL;
-  i2c_device_config_t dcfg = {
-    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-    .device_address  = GT911_ADDR,
-    .scl_speed_hz    = 400000,
-  };
-  if (i2c_master_bus_add_device(s_i2c_bus, &dcfg, &dev) == ESP_OK) {
-    // GT911 reset: 写 0 到 0x2024 寄存器
-    uint8_t rst[2] = {0x20, 0x24};
-    i2c_master_transmit(dev, rst, 2, 100);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    i2c_master_transmit(dev, (uint8_t[]){0x00}, 1, 100);
+  // ① 地址探测
+  uint8_t addr = 0x5D;
+  if (i2c_master_probe(s_i2c_bus, 0x5D, 100) != ESP_OK) {
+    if (i2c_master_probe(s_i2c_bus, 0x14, 100) == ESP_OK) {
+      addr = 0x14;
+    } else {
+      ESP_LOGE(TAG, "touch: GT911 no response on 0x5D/0x14");
+      return false;
+    }
   }
-  ESP_LOGI(TAG, "GT911 init done");
-}
+  ESP_LOGI(TAG, "touch: GT911 @0x%02X", addr);
 
-// GT911 每点8 字节：track_id(1) x(2) y(2) size(2) reserved(1)
-static uint16_t gt911_reg_read16(uint8_t reg) {
-  uint8_t buf[2] = {reg, 0};
-  i2c_master_dev_handle_t dev = NULL;
-  i2c_device_config_t dcfg = {
-    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-    .device_address  = GT911_ADDR,
-    .scl_speed_hz    = 400000,
-  };
-  if (i2c_master_bus_add_device(s_i2c_bus, &dcfg, &dev) != ESP_OK) return 0;
-  i2c_master_transmit_receive(dev, buf, 1, buf, 2, 100);
-  i2c_master_bus_rm_device(dev);
-  return (uint16_t)(buf[0] | (buf[1] << 8));
-}
+  esp_lcd_panel_io_handle_t io = NULL;
+  // 注意字段名：IDF 5.5 的 esp_lcd_panel_io_i2c_config_t 用 dev_addr
+  // （不是 device_address），且**没有** dev_addr_length ——
+  // 地址长度由 esp_lcd_new_panel_io_i2c_v2 固定为 7-bit。
+  esp_lcd_panel_io_i2c_config_t io_cfg = {};
+  io_cfg.dev_addr            = addr;
+  io_cfg.control_phase_bytes = 1;
+  io_cfg.dc_bit_offset       = 0;
+  io_cfg.lcd_cmd_bits        = 16;
+  io_cfg.scl_speed_hz        = 200000;      // ③
+  io_cfg.flags.disable_control_phase = 1;
+  esp_err_t err = esp_lcd_new_panel_io_i2c_v2(s_i2c_bus, &io_cfg, &io);
+  if (err != ESP_OK) { ESP_LOGE(TAG, "touch: i2c io failed %s", esp_err_to_name(err)); return false; }
 
-bool touchRead(Claw4TouchPoint* out) {
-  uint16_t status = gt911_reg_read16(GT911_STATUS);
-  if ((status & 0x8000) == 0) {          // 无新数据
-    out->down = false;
+  esp_lcd_touch_config_t tp = {};
+  tp.x_max = CLAW4_LCD_H_RES;              // 720，方屏
+  tp.y_max = CLAW4_LCD_V_RES;
+  tp.rst_gpio_num = (gpio_num_t)-1;          // ② 板上未接 RST
+  tp.int_gpio_num = (gpio_num_t)CLAW4_TOUCH_INT;   // 33
+  tp.levels.reset      = 0;
+  tp.levels.interrupt  = 0;                 // INT 低有效
+  tp.flags.swap_xy = 0;
+  tp.flags.mirror_x = 0;
+  tp.flags.mirror_y = 0;
+  err = esp_lcd_touch_new_i2c_gt911(io, &tp, &s_touch);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "touch: gt911 init failed %s", esp_err_to_name(err));
+    esp_lcd_panel_io_del(io);
     return false;
   }
-  uint8_t hdr[3];
-  uint8_t h[3] = {GT911_DATA, 0, 0};
-  i2c_master_dev_handle_t dev = NULL;
-  i2c_device_config_t dcfg = {
-    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-    .device_address  = GT911_ADDR,
-    .scl_speed_hz    = 400000,
-  };
-  if (i2c_master_bus_add_device(s_i2c_bus, &dcfg, &dev) != ESP_OK)
-    return false;
-  i2c_master_transmit_receive(dev, h, 1, hdr, 3, 100);
-  uint8_t npts = hdr[0];
-  if (npts == 0 || npts > GT911_MAX_PT) {
-    i2c_master_bus_rm_device(dev);
-    return false;
-  }
-  uint8_t pt[8] = {GT911_DATA, 0, 0};
-  uint8_t data[8] = {0};
-  i2c_master_transmit_receive(dev, pt, 1, data, 8, 100);
-  i2c_master_bus_rm_device(dev);
-
-  // 清数据有效位
-  uint8_t clr[2] = {GT911_STATUS, 0};
-  i2c_master_bus_add_device(s_i2c_bus, &dcfg, &dev);
-  i2c_master_transmit(dev, clr, 2, 100);
-  i2c_master_bus_rm_device(dev);
-
-  uint16_t x = data[1] | (data[2] << 8);
-  uint16_t y = data[3] | (data[4] << 8);
-  // GT911 原生分辨率通常是 720x720；若 config.h 的 SWAP_XY 生效需交换
-  out->x = x; out->y = y;
-  out->down = true;
+  s_touch_dev = true;
+  ESP_LOGI(TAG, "touch: GT911 ready (INT 33, 200kHz, no RST)");
   return true;
 }
 
-int touchWidth(void)  { return CLAW4_LCD_H_RES; }
-int touchHeight(void) { return CLAW4_LCD_V_RES; }
+bool touchRead(Claw4TouchPoint* out) {
+  if (!s_touch) return false;
+  esp_lcd_touch_data_t td = {};
+  bool pressed = false;
+  if (esp_lcd_touch_read_data(s_touch) != ESP_OK) return false;
+  pressed = (td.points == 1);
+  if (pressed) {
+    out->x = td.coords[0].x;
+    out->y = td.coords[0].y;
+  }
+  return pressed;
+}
 
 // ============================================================================
 // 音频：I2S 直写 PCM（绕过 codec 抽象，最小可用路径）
