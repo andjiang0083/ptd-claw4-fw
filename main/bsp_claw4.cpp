@@ -462,6 +462,81 @@ bool touchRead(Claw4TouchPoint* out) {
 }
 
 // ============================================================================
+// 音频功放（PA）：TCA9555 IO 扩展 —— 没它就没有声音
+// ============================================================================
+// 为什么必须单独驱动这块芯片：
+//   Claw4 的扬声器前面有功放，使能脚挂在板载 TCA9555 上，不经过 ESP32-P4
+//   的 GPIO。只把 I2S 配好是"信号到了功放门口"，功放没开 = 一声不响。
+//
+// 芯片是 16 位 IO 扩展，两个 8 位端口：
+//   0x02/0x03 = 输出寄存器（port0 / port1）
+//   0x06/0x07 = 方向寄存器（port0 / port1，1=输入 0=输出）
+// 写方向寄存器时带 auto-increment，一次写 2 字节就配完两个端口。
+//
+// ⚠️ 不做"读-改-写"：本固件不碰 GPS / 4G / 蓝牙 / SD 那些脚，把它们留在
+//   高阻（方向=输入）最安全 —— 写 0 反而会主动拉低、可能给不该上电的
+//   模块上电。只驱动我们自己要用的两根线。
+#define TCA9555_REG_OUT0 0x02
+#define TCA9555_REG_CFG0 0x06
+
+static i2c_master_dev_handle_t s_ioexp = NULL;
+
+static esp_err_t ioexpWrite(uint8_t reg, const uint8_t* d, size_t n) {
+  uint8_t buf[4];
+  buf[0] = reg;
+  memcpy(buf + 1, d, n);
+  return i2c_master_transmit(s_ioexp, buf, n + 1, 100);
+}
+
+// bit 编号是 TCA9555 的 io_index（0..7 = P0.0..P0.7，8..15 = P1.0..P1.7）
+static esp_err_t ioexpSet(uint8_t io_index, bool high) {
+  // 方向：目标位 0（输出），其余 1（输入/高阻）
+  uint8_t cfg[2];
+  if (io_index < 8) { cfg[0] = (uint8_t)~(1u << io_index); cfg[1] = 0xFF; }
+  else              { cfg[0] = 0xFF; cfg[1] = (uint8_t)~(1u << (io_index - 8)); }
+  esp_err_t e = ioexpWrite(TCA9555_REG_CFG0, cfg, 2);
+  if (e != ESP_OK) return e;
+  // 输出：目标位 = level，其余写 0（它们是输入，写了也不驱动）
+  uint8_t out[2] = {0, 0};
+  if (io_index < 8) out[0] = (uint8_t)(high ? (1u << io_index) : 0);
+  else              out[1] = (uint8_t)(high ? (1u << (io_index - 8)) : 0);
+  return ioexpWrite(TCA9555_REG_OUT0, out, 2);
+}
+
+void ioexpInit(void) {
+  i2c_bus_init();
+  if (!s_i2c_bus) { ESP_LOGE(TAG, "ioexp: I2C bus unavailable"); return; }
+  // probe 先行：老批次板子可能没有这颗芯片，不能让缺芯片变成开机崩溃
+  if (i2c_master_probe(s_i2c_bus, CLAW4_IOEXP_ADDR, 100) != ESP_OK) {
+    ESP_LOGW(TAG, "TCA9555 not found at 0x%02X — PA 无法使能，将没有声音",
+             CLAW4_IOEXP_ADDR);
+    return;
+  }
+  i2c_device_config_t dev = {
+    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+    .device_address  = CLAW4_IOEXP_ADDR,
+    .scl_speed_hz    = 100000,
+  };
+  if (i2c_master_bus_add_device(s_i2c_bus, &dev, &s_ioexp) != ESP_OK) {
+    ESP_LOGE(TAG, "ioexp: add device failed");
+    return;
+  }
+  // 音源选择：1 = 取 ESP32 这一路（0 = 4G 模组）。
+  // 这一根和 PA 是"与"关系，漏了它一样没声。
+  ioexpSet(CLAW4_IOEXP_PASW_BIT, true);
+  ioexpSet(CLAW4_IOEXP_PA_BIT, false);          // PA 先关着
+  ESP_LOGI(TAG, "TCA9555 ok @0x%02X  PA_SWITCH=1 (音源=ESP32), PA=0 (待延迟开)",
+           CLAW4_IOEXP_ADDR);
+  // 延迟开 PA：上电瞬间不推动放，避免"啪"一声爆音
+  xTaskCreate([](void*) {
+    vTaskDelay(pdMS_TO_TICKS(CLAW4_PA_DELAY_MS));
+    ioexpSet(CLAW4_IOEXP_PA_BIT, true);
+    ESP_LOGI(TAG, "PA enabled after %d ms boot delay", (int)CLAW4_PA_DELAY_MS);
+    vTaskDelete(nullptr);
+  }, "pa_enable", 2048, nullptr, 5, nullptr);
+}
+
+// ============================================================================
 // 音频：I2S 直写 PCM（绕过 codec 抽象，最小可用路径）
 // ============================================================================
 // sfx_data.h 是 16kHz 单声道 int16 PCM（= CLAW4_SPK_SR），格式天然对齐。
@@ -485,7 +560,12 @@ void audioInit(void) {
     .gpio_cfg = {
       .mclk = I2S_GPIO_UNUSED,
       .bclk = CLAW4_I2S_BCLK,
-      .ws   = I2S_GPIO_UNUSED,
+      // ⚠️ WS **不是** UNUSED：Claw4 的 SPK 只有 BCLK/DOUT 两根线，
+      //   WS 与 MIC 共用 GPIO10（官方板文件里 BTAudioCodecDuplex 就是
+      //   (bclk=12, ws=10, dout=9, din=11) 这么传的）。
+      //   之前这里写 I2S_GPIO_UNUSED ⇒ 有数据、没帧同步 ⇒ 功放收到
+      //   一串对不上边界的位流 ⇒ 一声不响。
+      .ws   = CLAW4_I2S_MIC_WS,
       .dout  = CLAW4_I2S_DOUT,
       .din   = I2S_GPIO_UNUSED,
       .invert_flags = { false, false, false },

@@ -84,6 +84,11 @@ extern "C" void app_main(void) {
   g_bsp.init();
   g_gfx = GfxFb(g_bsp.fb, false);      // 借用 BSP 的 PSRAM 帧缓冲
   if (!touchInit()) ESP_LOGW(TAG, "touch unavailable — 画面可看，交互不可用");
+  // 功放使能**先于** I2S：Claw4 的扬声器前面有个功放，使能脚在板载
+  // TCA9555 上，不经过 ESP32-P4 的 GPIO。只配 I2S = 信号到功放门口，
+  // 门没开就是一声不响。它还带 2.5s 延迟（避免上电爆音），所以一路
+  // 通上电 —— 主循环不等它。
+  ioexpInit();
   audioInit();
   audioSetVolume(70);
   nvsInit();

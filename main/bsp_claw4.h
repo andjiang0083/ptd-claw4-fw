@@ -75,6 +75,20 @@
 #define CLAW4_I2S_DOUT       ((gpio_num_t)9)
 #define CLAW4_I2S_MIC_WS     ((gpio_num_t)10)
 #define CLAW4_I2S_MIC_DIN    ((gpio_num_t)11)
+
+// ── 音频功放：挂在 TCA9555（I2C 0x20）上，**不是** GPIO 直驱 ──────────
+// Claw4 的扬声器前面串了一个功放，它的使能脚不在 ESP32-P4 的 GPIO 上，
+// 而在板载的 TCA9555 IO 扩展芯片上：
+//     PA        = P1.0（io_index 8）  —— 1 = 功放开
+//     PA_SWITCH = P0.1（io_index 1）  —— 1 = 音源取 ESP32（0 = 4G 模组）
+// 两个都必须对，缺任何一个都是"静音"，而且症状完全一样，看不出是哪个：
+//   只开 PA 不选音源  → 功放放大的是 4G 模组那一路（本固件下一直静音）
+//   只选音源不开 PA   → 信号到了功放输入，但功放没供电
+// PA 还要**延迟开**：官方固件上电后 5s 才开（避免上电瞬间推动放爆音）。
+#define CLAW4_IOEXP_ADDR     0x20      // TCA9555，A0=A1=A2=0
+#define CLAW4_IOEXP_PA_BIT   8         // io_index（TCA9555 P1.0）
+#define CLAW4_IOEXP_PASW_BIT 1         // io_index（TCA9555 P0.1）
+#define CLAW4_PA_DELAY_MS    2500      // 上电 → 开功放的间隔
 #define CLAW4_SPK_SR         16000       // SFX_SR 也是 16kHz，天然对齐
 
 // ════════════════════════════════════════════════════════════════════
@@ -138,6 +152,7 @@ int   touchWidth(void);
 int   touchHeight(void);
 
 // ── 音频 ────────────────────────────────────────────────────────────
+void  ioexpInit(void);
 void  audioInit(void);
 void  audioPlayRaw(const int16_t* data, size_t len, uint32_t sr);
 void  audioSetVolume(int pct);
