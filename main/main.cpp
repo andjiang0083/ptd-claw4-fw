@@ -107,10 +107,68 @@ extern "C" void app_main(void) {
   levelLoad(0);
   g_w.state = ST_TITLE;
   drawTitle(&g_gfx);
-  g_bsp.commit();       // 首帧立即推送，不等主循环（否则白屏 1 帧）
+  // 首帧推送 = 全屏 msync。这是 720x720 RGB888 的**固有下限**：
+  // 无论怎么优化，整屏推一次就要回写这么多。量出它，才知道脏矩形
+  // 省下的那 64% 值多少。
+  {
+    const uint32_t t0 = millis();
+    g_bsp.commit();     // 首帧立即推送，不等主循环（否则白屏 1 帧）
+    ESP_LOGI(TAG, "first commit (full 720x720 RGB888 msync) = %u ms",
+             (unsigned)(millis() - t0));
+  }
 
   ESP_LOGI(TAG, "unlock=%04X cleared=%04X levels=%d",
            g_unlocked, g_cleared, LEVEL_COUNT);
+
+  // ── 一次性对照基准：老管线那笔每帧全量 565→888 展开，在 P4 上值多少 ──
+  // 真机数字才有说服力。这里用与 v0.5.0 commit() 完全相同的循环体、
+  // 相同的 -Os 编译选项、相同的 PSRAM 目标缓冲，只是把结果丢掉。
+  // 测完立刻释放，不占用运行时内存。
+  {
+    const size_t n2 = (size_t)SCREEN_W * SCREEN_H * 2;
+    const size_t n3 = (size_t)SCREEN_W * SCREEN_H * 3;
+    uint16_t* tmp565 = (uint16_t*)heap_caps_malloc(n2, MALLOC_CAP_SPIRAM);
+    uint8_t*  tmp888 = (uint8_t*)heap_caps_malloc(n3, MALLOC_CAP_SPIRAM);
+    if (tmp565 && tmp888) {
+      for (int i = 0; i < SCREEN_W * SCREEN_H; ++i) tmp565[i] = (uint16_t)i;
+      const uint32_t t0 = millis();
+      for (int i = 0; i < SCREEN_W * SCREEN_H; ++i) {
+        const uint16_t v = tmp565[i];
+        tmp888[i*3+0] = (uint8_t)(((v >> 11) & 0x1F) * 255 / 31);
+        tmp888[i*3+1] = (uint8_t)(((v >> 5) & 0x3F) * 255 / 63);
+        tmp888[i*3+2] = (uint8_t)((v & 0x1F) * 255 / 31);
+      }
+      ESP_LOGI(TAG, "[bench] v0.5.0 565->888 expand = %u ms/frame  (v0.5.1 = 0)",
+               (unsigned)(millis() - t0));
+    }
+    heap_caps_free(tmp565);
+    heap_caps_free(tmp888);
+  }
+
+  // ── 一次性对照基准 ②：新管线的"渲染 + 提交"每帧成本 ──────────────
+  // 上面量的是"省掉了多少"，这里量的是"现在剩多少"。两个数字放一起
+  // 才知道 30fps 的 33ms 预算还剩多少。
+  {
+    int wasState = (int)g_w.state;
+    levelLoad(0); g_w.gold = 9999; g_w.lives = 20; g_w.state = ST_READY;
+    for (int i = 0; i < 8; ++i) buildTower(3 + i * 2, 5, i % 5);
+    startNextWave();
+    const int N = 30;
+    uint32_t t0 = millis();
+    for (int f = 0; f < N; ++f) {
+      GfxFb::dirtyReset();
+      gameUpdate(33);
+      renderFrame(&g_gfx);
+      g_bsp.commit();
+    }
+    ESP_LOGI(TAG, "[bench] v0.5.1 update+render+commit = %u ms/frame (avg over %d)",
+             (unsigned)((millis() - t0) / N), N);
+    // 还原到开机该有的状态（这段只是测量，不该留下痕迹）
+    levelLoad(0);
+    g_w.state = (GameState)wasState;
+    drawTitle(&g_gfx);
+    g_bsp.commit();
+  }
 
   // ── 3. 主循环（对应上游 loop()）─────────────────────────────────
   static uint32_t lastFrame = 0;
