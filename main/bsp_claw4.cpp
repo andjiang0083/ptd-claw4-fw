@@ -417,17 +417,38 @@ bool touchInit(void) {
   return true;
 }
 
+// ⚠️ v0.5.0 真机"画面正常但点不动"根因，两个 bug 叠在一起：
+//
+// ① esp_lcd_touch_read_data() **只负责读**，它把数据存进驱动的内部
+//    状态；坐标必须再调 esp_lcd_touch_get_data() 取。
+//    我原先在 read_data() 之后直接读一个**局部空结构体** td
+//    （esp_lcd_touch_data_t td = {}）—— 那玩意永远是空的，
+//    td.points 恒为 0 ⇒ 函数永远返回 false ⇒ 上层 tapRead 认为
+//    "从没按下过" ⇒ 点击全部丢弃。
+//
+// ② out->down 从未赋值。tapRead() 判断的是 p.down，
+//    而 Claw4TouchPoint 是调用方栈上的未初始化变量，
+//    down 是随机垃圾值。即使 ① 修好了，② 也会让点击随机失效。
+//
+// 两个 bug 的症状完全相同（点不动），且都不产生任何编译警告或
+// 运行时日志 —— 因为 GT911 初始化是成功的，串口照样打
+// "touch: GT911 ready"，看起来一切都对。
+//
+// 修法：read_data 后用 get_data 取真实坐标，并显式给 down 赋值。
 bool touchRead(Claw4TouchPoint* out) {
   if (!s_touch) return false;
-  esp_lcd_touch_data_t td = {};
-  bool pressed = false;
   if (esp_lcd_touch_read_data(s_touch) != ESP_OK) return false;
-  pressed = (td.points == 1);
-  if (pressed) {
-    out->x = td.coords[0].x;
-    out->y = td.coords[0].y;
+
+  esp_lcd_touch_point_data_t pts[1] = {};
+  uint8_t cnt = 0;
+  if (esp_lcd_touch_get_data(s_touch, pts, &cnt, 1) != ESP_OK) return false;
+
+  out->down = (cnt >= 1);          // ② 显式赋值，不留随机值
+  if (out->down) {
+    out->x = pts[0].x;
+    out->y = pts[0].y;
   }
-  return pressed;
+  return out->down;
 }
 
 // ============================================================================
