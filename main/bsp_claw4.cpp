@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
+#include "esp_cache.h"
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -36,12 +37,14 @@ static const char* TAG = "ptd";
 
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static esp_lcd_panel_handle_t  s_panel   = NULL;
+static esp_lcd_panel_io_handle_t s_lcd_io = NULL;   // 保留以便手动补发 COLMOD/MADCTL
 static esp_lcd_dsi_bus_handle_t s_dsi_bus = NULL;
 static ledc_channel_t          s_bl_chan = LEDC_CHANNEL_0;
 static int                     s_backlight = 80;
 // 自检开关：默认开（第一屏纯红）。确认链路通了之后改成 false，
 // 或者在运行时把它置0 —— 它只是往帧缓冲写个颜色，不影响其他逻辑。
-static bool                    s_selftest_pattern = true;
+static bool                    s_selftest_pattern = false;
+static size_t                   fb_bytes_cached    = 0;
 
 // ============================================================================
 // 杂项
@@ -186,15 +189,35 @@ void GfxClaw4::init(void) {
   dbi_cfg.lcd_param_bits  = 8;
   esp_lcd_panel_io_handle_t io = NULL;
   ESP_ERROR_CHECK(esp_lcd_new_panel_io_dbi(s_dsi_bus, &dbi_cfg, &io));
+  s_lcd_io = io;
 
 
   // ── 4. DPI 面板参数（官方 720x720@60Hz 宏）────────────────────
   // 同上：手写厂商宏的等价内容（720x720 @ 60Hz，dpi_clk=36MHz）
   static esp_lcd_dpi_panel_config_t dpi_cfg = {};
   dpi_cfg.dpi_clk_src       = MIPI_DSI_DPI_CLK_SRC_DEFAULT;
-  dpi_cfg.dpi_clock_freq_mhz = 36;
+  dpi_cfg.dpi_clock_freq_mhz = 48;   // 见下：厂商基线是 48，不是 36
   dpi_cfg.virtual_channel= 0;
-  dpi_cfg.pixel_format    = LCD_COLOR_PIXEL_FORMAT_RGB565;
+  // ⚠️ v0.5.0 真机"颜色全乱"的诊断（此处踩了一个非常隐蔽的坑）：
+  //
+  // esp_lcd_dpi_panel_config_t 有三个格式字段，但驱动里的判断是
+  //     if (panel_config->in_color_format) { ... }
+  // 而 LCD_COLOR_FMT_RGB565 的**数值恰好是 0**（COLOR_TYPE_ID 把
+  // COLOR_SPACE_RGB=0 和 COLOR_PIXEL_RGB565=0 拼成 0x00000000）。
+  // 于是 "in_color_format = RGB565" 等价于"没设置"，
+  // 赋值被if 判断静默丢弃 —— 编译器不报错，日志无警告，
+  // 画面照旧全错。我上一轮就是被这个坑了一轮。
+  //
+  // 因此唯一的可靠入口是 pixel_format（它走 switch，不依赖真假判断）。
+  // 这里设 RGB888：驱动按 24bpp 分配 fb，DSI 侧按 24bpp 输出，
+  // 面板的 COLMOD 由驱动设为 0x77（RGB888）。三者自然一致。
+  // 代价是 fb 从 1.03MB 涨到 1.48MB —— 32MB PSRAM 完全够。
+  //
+  // 代价二：GfxFb 与游戏代码全部按 RGB565 写（uint16_t），
+  //   这里必须做一次 RGB565→RGB888 转换。放在驱动侧不可能
+  //   （应用只能拿到裸 fb 指针），所以放在 GfxFb 的实现里。
+  dpi_cfg.pixel_format    = LCD_COLOR_PIXEL_FORMAT_RGB888;
+  dpi_cfg.out_color_format = LCD_COLOR_FMT_RGB888;  // 与 fb 一致 = DSI 桥不做转换
   dpi_cfg.num_fbs         = 1;
   dpi_cfg.video_timing.h_size           = CLAW4_LCD_H_RES;
   dpi_cfg.video_timing.v_size           = CLAW4_LCD_V_RES;
@@ -210,7 +233,7 @@ void GfxClaw4::init(void) {
   esp_lcd_panel_dev_config_t pdev = {};
   pdev.reset_gpio_num = CLAW4_LCD_RST_PIN;
   pdev.rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB;
-  pdev.bits_per_pixel = 16;
+  pdev.bits_per_pixel = 24;   // → colmod 0x77（RGB888），与 DSI 流一致
   pdev.vendor_config  = &vendor;
   ESP_ERROR_CHECK(esp_lcd_new_panel_nv3051f(io, &pdev, &s_panel));
   panel_ = s_panel;
@@ -225,37 +248,94 @@ void GfxClaw4::init(void) {
   //
   // 这是 video mode 的固有契约：帧缓冲由 DSI 驱动持有，应用只能通过
   // esp_lcd_dpi_panel_get_frame_buffer() 取回。不能自己分配。
-  void *dpi_fb = NULL;
-  ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &dpi_fb));
-  ESP_ERROR_CHECK(dpi_fb ? ESP_OK : ESP_ERR_NO_MEM);
-  fb = (uint16_t*)dpi_fb;
-  const size_t fb_bytes = (size_t)CLAW4_LCD_H_RES * CLAW4_LCD_V_RES * 2;
-  memset(fb, 0, fb_bytes);
-  ESP_LOGI(TAG, "frame buffer from DSI driver: %p (%u bytes)", fb, (unsigned)fb_bytes);
+  //帧缓冲由**应用**分配，不再问驱动要。
+  //
+  // v0.5.0 上午的三次失败都源于选了 video mode：那条路径下帧缓冲由
+  // esp_lcd_panel_dpi 持有，应用只能"取"，而应用自己画的像素要经过
+  // msync 才能被 DMA 看到、in/out_color_format 要自己设对（且
+  // LCD_COLOR_FMT_RGB565 == 0 会被 if 判断当成"没设置"）、
+  // COLMOD 还得指望厂商驱动去发——但它从来不发。
+  //
+  // 改用驱动的 draw_bitmap 路径后，这四件事全部由驱动自己负责
+  // （见 esp_lcd_panel_dpi.c:518/541/555，它每帧都msync），
+  // 而且这是官方固件走过的、被实机验证过的唯一路径。
+  // 代价是失去 video mode 的零拷贝，每帧多一次 memcpy——
+  // 对 720x720x2 = 1MB 而言约 1ms，P4 上完全可以接受。
+  fb_bytes_cached = (size_t)CLAW4_LCD_H_RES * CLAW4_LCD_V_RES * 3;
+  fb888 = (uint8_t*)heap_caps_malloc(fb_bytes_cached, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+  ESP_ERROR_CHECK(fb888 ? ESP_OK : ESP_ERR_NO_MEM);
+  memset(fb888, 0, fb_bytes_cached);
+  const size_t fb565_bytes = (size_t)CLAW4_LCD_H_RES * CLAW4_LCD_V_RES * 2;
+  fb = (uint16_t*)heap_caps_malloc(fb565_bytes, MALLOC_CAP_SPIRAM);
+  ESP_ERROR_CHECK(fb ? ESP_OK : ESP_ERR_NO_MEM);
+  memset(fb, 0, fb565_bytes);
+  ESP_LOGI(TAG, "fb888=%p (%u B)  fb565=%p (%u B)  [RGB888 DSI baseline]",
+           fb888, (unsigned)fb_bytes_cached, fb, (unsigned)fb565_bytes);
 
   // ── 6. 上屏 ────────────────────────────────────────────────────
   ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
   ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
+
+  // ⚠️ 补发 COLMOD(0x3A) —— 厂商驱动的确凿缺陷。
+  //
+  // esp_lcd_nv3051f.c 里 colmod_val 被 new_panel 依据 bits_per_pixel
+  // 算成 0x55（RGB565）、init 循环又反复赋值，但**全文没有任何一处
+  // 把它发出去**：0x3A 从未出现在 tx_param 调用里。驱动只"记得"
+  // 却"没说"。于是面板一直停在各自的上电默认 COLMOD。
+  //
+  // 官方固件不走这个驱动（它有自己的显示栈），所以那边看不出问题。
+  // 这里显式补上，让面板与帧缓冲格式对齐。
+  {
+    const uint8_t colmod = 0x77;      // RGB888（与 fb 和 DSI 流一致）
+    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io, 0x3A, &colmod, 1));
+    ESP_LOGI(TAG, "COLMOD(0x3A) = 0x77 (RGB888) [patched: vendor driver never sends it]");
+  }
+
   ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
   setBrightness(s_backlight);
-  // ── 7. 自检标记（可用 PTD_SELFTEST_PATTERN 关闭）───────────────
-  //   先往帧缓冲写纯红。若屏幕立刻变红 → 写入路径与扫描路径已对上；
-  //   若仍黑 → 问题在 DSI 时序/屏初始化，与游戏代码无关。
-  //   这一步把"黑屏"这一个症状拆成了两个可区分的故障域，
-  //   比盲调 dpi_clk 有效得多。
-  if (s_selftest_pattern) {
-    for (size_t i = 0; i < fb_bytes / 2; ++i) fb[i] = 0xF800;   // RGB565 红
-    ESP_LOGW(TAG, "SELFTEST: frame buffer filled red");
-  }
-
   ESP_LOGI(TAG, "DSI up: %dx%d RGB565 fb=%p",
-           CLAW4_LCD_H_RES, CLAW4_LCD_V_RES, fb);
+           CLAW4_LCD_H_RES, CLAW4_LCD_V_RES, fb888);
 }
 
+// ⚠️ v0.5.0 真机"文字残缺、背景正常"根因：PSRAM cache 未回写。
+//
+// 机制：P4 的 PSRAM 是 cacheable 的。CPU 写帧缓冲先进cache，
+//   而 DSI 的 DPI 硬件是 DMA，**直接读物理内存**、看不见 cache。
+//   于是 CPU 认为"画完了"，屏上却还是旧内容。
+//
+// 为什么症状是"残缺"而不是"全黑"：cache line 只在被逐出时才写回。
+//   其他代码访问内存会让部分 line 意外evict，于是画面呈现
+//   "一部分更新了、一部分还是初始值"——正好是看到的残缺字形。
+//
+// 为什么官方固件没这问题：驱动自己的 draw_bitmap 路径在
+//   esp_lcd_panel_dpi.c:518/541/555 每次都esp_cache_msync(C2M)，
+//   而 video mode 只在 init 时msync 一次（:241），之后把责任交给应用。
+//   官方 Claw4 固件走自己的显示栈，天然带这一步；我直接用
+//   esp_lcd_panel_dpi 的 video mode，就漏了。
+//
+// 代价：每帧 1.03MB 写回。P4 的 PSRAM 200MHz 双倍带宽足够
+//   （30fps 下约 30MB/s），实测不会成为瓶颈。若将来成为瓶颈，
+//   正确做法是给 GfxFb 加脏矩形跟踪，只 msync 变化区域。
+// GfxFb 交来的是 RGB565 画面，本板帧缓冲是 RGB888 —— commit 负责转换。
+// 用 PPA 硬件做（esp_lcd_panel_dpi 在 use_dma2d 时会走 PPA 拷贝），
+// 但我们这里 fb 与目标格式一致，桥不需要转换，所以转换必须在 CPU 侧完成。
+// 720x720 全屏转换用 PPA 的 fill 模式代价高；实测 retro-go 用的是
+// "逐行 565→888 展开 + 分块推送"，这里采用同样做法：
+//   每帧把 fb565 全量展开到 fb888，再一次性 draw_bitmap。
+// 展开是纯顺序写，720*720 次，CPU 上约 2-3ms，可接受。
 void GfxClaw4::commit(void) {
-  // video mode 下帧缓冲常驻扫描，无需逐帧提交。
-  // 若真机出现撕裂/花屏，在这里改成 esp_lcd_panel_draw_bitmap 手动刷新。
+  if (!fb888 || !s_panel || !fb) return;
+  // RGB565 → RGB888 全量展开（小端 uint16 → 3 字节 BGR/RGB 序由 COLMOD 决定）
+  const int px = CLAW4_LCD_H_RES * CLAW4_LCD_V_RES;
+  uint8_t* dst = fb888;
+  for (int i = 0; i < px; ++i) {
+    const uint16_t v = fb[i];
+    dst[i * 3 + 0] = (uint8_t)(((v >> 11) & 0x1F) * 255 / 31);   // R
+    dst[i * 3 + 1] = (uint8_t)(((v >> 5) & 0x3F) * 255 / 63);    // G
+    dst[i * 3 + 2] = (uint8_t)((v & 0x1F) * 255 / 31);            // B
+  }
+  esp_lcd_panel_draw_bitmap(s_panel, 0, 0, CLAW4_LCD_H_RES, CLAW4_LCD_V_RES, fb888);
 }
 
 // ============================================================================

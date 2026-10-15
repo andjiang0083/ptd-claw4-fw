@@ -79,6 +79,9 @@
 //      "真机出现撕裂时的手动刷新"挂载点。
 class GfxClaw4 {
  public:
+  // DSI 目标缓冲：RGB888（面板 colmod 0x77 / DSI 流 out_color_format 均为 RGB888）
+  uint8_t*  fb888 = nullptr;
+  // GfxFb 写入的中间缓冲：RGB565（游戏侧仍按 565 生成）
   uint16_t* fb = nullptr;
   void init(void);
   void setRotation(int) {}             // 方形屏 native 朝向即最终朝向

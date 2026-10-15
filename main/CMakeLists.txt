@@ -21,6 +21,7 @@ idf_component_register(
         "${PTD_SRC_ROOT}/src"
     REQUIRES
         esp_lcd
+        esp_mm            # esp_cache_msync（PSRAM cache 回写，video mode 必需）
         esp_hw_support
         esp_driver_i2c
         esp_driver_i2s

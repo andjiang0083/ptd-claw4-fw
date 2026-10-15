@@ -109,6 +109,7 @@ extern "C" void app_main(void) {
   levelLoad(0);
   g_w.state = ST_TITLE;
   drawTitle(&g_gfx);
+  g_bsp.commit();       // 首帧立即推送，不等主循环（否则白屏 1 帧）
 
   ESP_LOGI(TAG, "unlock=%04X cleared=%04X levels=%d lang=%s",
            g_unlocked, g_cleared, LEVEL_COUNT, langCN() ? "CN" : "EN");
@@ -124,8 +125,13 @@ extern "C" void app_main(void) {
     if (tapRead(&t)) handleTap(&g_gfx, t);
 
     // 标题 / 选关：静态画面，无世界逻辑
-    if (g_w.state == ST_TITLE) { delayMs(20); continue; }
-    if (g_w.state == ST_SEL)   { updateSelFx(&g_gfx); delayMs(20); continue; }
+    // ⚠️ draw_bitmap 模式下每帧都要commit。标题/选关界面虽然是静态的，
+    // 但 drawTitle() 只在启动时调一次，若这里 continue 掉，帧缓冲永远
+    // 停留在初始的黑色—— 屏上就是全黑。
+    // 这正是 video mode 与 draw_bitmap 的关键差异：前者 DPI 硬件持续
+    // 扫描 fb，应用画完即可；后者必须每帧显式推一次。
+    if (g_w.state == ST_TITLE) { g_bsp.commit(); delayMs(20); continue; }
+    if (g_w.state == ST_SEL)   { updateSelFx(&g_gfx); g_bsp.commit(); delayMs(20); continue; }
 
     uint32_t now = millis();
     uint32_t dt = now - lastFrame;
