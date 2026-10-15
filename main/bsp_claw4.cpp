@@ -39,6 +39,9 @@ static esp_lcd_panel_handle_t  s_panel   = NULL;
 static esp_lcd_dsi_bus_handle_t s_dsi_bus = NULL;
 static ledc_channel_t          s_bl_chan = LEDC_CHANNEL_0;
 static int                     s_backlight = 80;
+// 自检开关：默认开（第一屏纯红）。确认链路通了之后改成 false，
+// 或者在运行时把它置0 —— 它只是往帧缓冲写个颜色，不影响其他逻辑。
+static bool                    s_selftest_pattern = true;
 
 // ============================================================================
 // 杂项
@@ -184,16 +187,6 @@ void GfxClaw4::init(void) {
   esp_lcd_panel_io_handle_t io = NULL;
   ESP_ERROR_CHECK(esp_lcd_new_panel_io_dbi(s_dsi_bus, &dbi_cfg, &io));
 
-  // ── 3. 帧缓冲（PSRAM，DMA 可访问）─────────────────────────────
-  // 720*720*2 = 1.03 MB。必须带 MALLOC_CAP_DMA：DSI DMA 要读它。
-  const size_t fb_bytes = (size_t)CLAW4_LCD_H_RES * CLAW4_LCD_V_RES * 2;
-  fb = (uint16_t*)heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-  if (!fb) {
-    ESP_LOGW(TAG, "PSRAM fb alloc failed, fallback to internal RAM");
-    fb = (uint16_t*)malloc(fb_bytes);
-  }
-  ESP_ERROR_CHECK(fb ? ESP_OK : ESP_ERR_NO_MEM);
-  memset(fb, 0, fb_bytes);
 
   // ── 4. DPI 面板参数（官方 720x720@60Hz 宏）────────────────────
   // 同上：手写厂商宏的等价内容（720x720 @ 60Hz，dpi_clk=36MHz）
@@ -222,12 +215,40 @@ void GfxClaw4::init(void) {
   ESP_ERROR_CHECK(esp_lcd_new_panel_nv3051f(io, &pdev, &s_panel));
   panel_ = s_panel;
 
+  // ⚠️ v0.5.0 真机黑屏根因：帧缓冲必须用 **驱动分配的那一块**。
+  //
+  // 之前我在 PSRAM 里自己 malloc 了 1.03MB，然后交给 GfxFb 画。但
+  // esp_lcd_new_panel_dpi() **自己**又分配了一块（见 esp_lcd_panel_dpi.c:233，
+  // 同样是 PSRAM | MALLOC_CAP_DMA），DPI 硬件扫描的是它，不是我的那块。
+  // 于是整个游戏把画面画在一块从未被扫描的内存里 —— 初始化全绿
+  //（DSI up / GT911 / audio init都成功），但屏幕永远黑。
+  //
+  // 这是 video mode 的固有契约：帧缓冲由 DSI 驱动持有，应用只能通过
+  // esp_lcd_dpi_panel_get_frame_buffer() 取回。不能自己分配。
+  void *dpi_fb = NULL;
+  ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &dpi_fb));
+  ESP_ERROR_CHECK(dpi_fb ? ESP_OK : ESP_ERR_NO_MEM);
+  fb = (uint16_t*)dpi_fb;
+  const size_t fb_bytes = (size_t)CLAW4_LCD_H_RES * CLAW4_LCD_V_RES * 2;
+  memset(fb, 0, fb_bytes);
+  ESP_LOGI(TAG, "frame buffer from DSI driver: %p (%u bytes)", fb, (unsigned)fb_bytes);
+
   // ── 6. 上屏 ────────────────────────────────────────────────────
   ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
   ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
   ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
   setBrightness(s_backlight);
+  // ── 7. 自检标记（可用 PTD_SELFTEST_PATTERN 关闭）───────────────
+  //   先往帧缓冲写纯红。若屏幕立刻变红 → 写入路径与扫描路径已对上；
+  //   若仍黑 → 问题在 DSI 时序/屏初始化，与游戏代码无关。
+  //   这一步把"黑屏"这一个症状拆成了两个可区分的故障域，
+  //   比盲调 dpi_clk 有效得多。
+  if (s_selftest_pattern) {
+    for (size_t i = 0; i < fb_bytes / 2; ++i) fb[i] = 0xF800;   // RGB565 红
+    ESP_LOGW(TAG, "SELFTEST: frame buffer filled red");
+  }
+
   ESP_LOGI(TAG, "DSI up: %dx%d RGB565 fb=%p",
            CLAW4_LCD_H_RES, CLAW4_LCD_V_RES, fb);
 }
