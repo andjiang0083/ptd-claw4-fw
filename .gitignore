@@ -7,8 +7,11 @@ dependencies.lock
 # 托管组件（idf.py build 会按 idf_component.yml 重新拉取）
 managed_components/
 
-# 生成的配置（由 ../pixel-tower-defense/tools/layout.py --profile claw4 生成）
-gen/config_gen.h
+# 生成的配置 —— ⚠️ v0.5.1：**必须入库**。
+#   它确实是由 ../pixel-tower-defense/tools/layout.py --profile claw4
+#   生成的，但本仓是独立仓库：clone 下来的人手上没有游戏仓，
+#   忽略它 = 公开仓库编译不了。单一真源仍归游戏仓（改动请去那边），
+#   这里只是把生成物随仓发布。
 
 # macOS
 .DS_Store

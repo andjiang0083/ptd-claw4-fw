@@ -119,3 +119,25 @@ I (xxx) ptd: audio init ok (I2S1 BCLK=12 DOUT=9 @16000Hz)
 I (xxx) ptd: GT911 init done
 I (xxx) ptd: unlock=0001 cleared=0000 levels=20 lang=EN
 ```
+
+## 关于 `gen/config_gen.h`
+
+这个文件**看起来该进 .gitignore**（它是生成物），但本仓刻意把它入库：
+
+- 它由游戏仓 `pixel-tower-defense` 的 `tools/layout.py --profile claw4` 生成，
+  是网格 / 关卡 / 塔表 / 敌人数值的**唯一真源**；
+- 但本仓是**独立仓库**，clone 下来的人手上没有游戏仓 —— 忽略它的后果是
+  "公开仓库 clone 下来编译不了"。
+
+所以这里的约定是：**单一真源归游戏仓，生成物随本仓发布**。
+
+要改关卡 / 数值 / 几何，请去 `pixel-tower-defense` 的 `claw4` 分支改
+`tools/layout.py`，重新生成后把 `build/claw4/config_gen.h` 复制过来：
+
+```sh
+python3 ../pixel-tower-defense/tools/layout.py --profile claw4 --no-preview
+cp ../pixel-tower-defense/build/claw4/config_gen.h gen/config_gen.h
+```
+
+游戏仓那边有 CI 守着"生成物必须与生成器一致"（`git diff --exit-code`），
+本仓这边没有那道检查 —— 这个不对称是已知的、有意的（本仓不做游戏设计）。
